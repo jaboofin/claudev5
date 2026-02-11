@@ -10,6 +10,7 @@ import time
 import logging
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 from enum import Enum
@@ -127,6 +128,64 @@ class PolymarketClient:
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
+
+    def _normalize_resolution(self, value: Optional[str]) -> Optional[str]:
+        """Normalize Gamma/CLOB resolution strings to bot directions (up/down)."""
+        if value is None:
+            return None
+
+        normalized = re.sub(r"[^a-z]", "", str(value).lower())
+        up_values = {
+            "up", "yes", "long", "bull", "higher", "above", "increase", "true", "1"
+        }
+        down_values = {
+            "down", "no", "short", "bear", "lower", "below", "decrease", "false", "0"
+        }
+
+        if normalized in up_values:
+            return "up"
+        if normalized in down_values:
+            return "down"
+        return None
+
+    async def _refresh_market_resolution(self, condition_id: str) -> None:
+        """Fetch latest market resolution from Gamma for a traded condition id."""
+        session = await self._get_session()
+        url = f"{self.config.gamma_api_url}/markets/{condition_id}"
+
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                return
+            payload = await resp.json()
+
+        market = self._active_markets.get(condition_id)
+        if market is None:
+            return
+
+        raw_resolution = (
+            payload.get("resolution")
+            or payload.get("outcome")
+            or payload.get("winner")
+            or payload.get("winningOutcome")
+        )
+        normalized_resolution = self._normalize_resolution(raw_resolution)
+
+        # Some payloads provide tokens/outcomes instead of a direct winner string.
+        if normalized_resolution is None:
+            outcomes = payload.get("outcomes") or []
+            winner_index = payload.get("winnerIndex")
+            if isinstance(winner_index, int) and 0 <= winner_index < len(outcomes):
+                normalized_resolution = self._normalize_resolution(outcomes[winner_index])
+
+        # Mark resolved when terminal flags are set even if direction mapping fails.
+        market.resolved = bool(
+            payload.get("resolved")
+            or payload.get("closed")
+            or payload.get("isResolved")
+            or payload.get("status") == "resolved"
+            or normalized_resolution is not None
+        )
+        market.resolution = normalized_resolution
 
     # ── Market Discovery ────────────────────────────────────────
 
@@ -270,6 +329,12 @@ class PolymarketClient:
         for r in self._trade_records:
             if r.outcome is not None:
                 continue
+            if r.market_condition_id in self._active_markets:
+                try:
+                    await self._refresh_market_resolution(r.market_condition_id)
+                except Exception as e:
+                    logger.warning(f"Resolution refresh failed for {r.market_condition_id}: {e}")
+
             m = self._active_markets.get(r.market_condition_id)
             if not m or not m.resolved or not m.resolution:
                 continue

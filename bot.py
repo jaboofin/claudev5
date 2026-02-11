@@ -132,6 +132,10 @@ class BTCPredictionBot:
                         "market": opp.question[:80],
                     })
 
+            # Compute directional side once so hedge + execution use the
+            # exact same signal output for this cycle.
+            direction = decision.direction.value
+
             # 6b. Hedge check (if enabled)
             open_trades = self.polymarket.get_trade_records()
             hedges = self.edge.check_hedge(
@@ -160,7 +164,6 @@ class BTCPredictionBot:
                         })
 
             # 7. Execute directional trade
-            direction = decision.direction.value
             size = self.risk_manager.calculate_position_size(decision.confidence)
             if size <= 0:
                 return
